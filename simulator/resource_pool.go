@@ -108,10 +108,40 @@ func (p *ResourcePool) createChild(ctx *Context, name string, spec types.Resourc
 
 	child.Name = name
 	child.Owner = p.Owner
+
+	summary := *child.Summary.GetResourcePoolSummary()
+	child.Summary = &summary
+
 	child.Summary.GetResourcePoolSummary().Name = name
 	child.Config.CpuAllocation = spec.CpuAllocation
 	child.Config.MemoryAllocation = spec.MemoryAllocation
 	child.Config.Entity = spec.Entity
+	child.Summary.GetResourcePoolSummary().Config = child.Config
+
+	if spec.CpuAllocation.Reservation != nil {
+		child.Runtime.Cpu.ReservationUsed = 0
+		child.Runtime.Cpu.ReservationUsedForVm = 0
+		child.Runtime.Cpu.UnreservedForPool = *spec.CpuAllocation.Reservation
+		child.Runtime.Cpu.UnreservedForVm = *spec.CpuAllocation.Reservation
+		child.Runtime.Cpu.MaxUsage = *spec.CpuAllocation.Reservation
+		if spec.CpuAllocation.Limit != nil && *spec.CpuAllocation.Limit != -1 {
+			child.Runtime.Cpu.MaxUsage = *spec.CpuAllocation.Limit
+		}
+	}
+
+	if spec.MemoryAllocation.Reservation != nil {
+		resBytes := *spec.MemoryAllocation.Reservation * 1024 * 1024
+		child.Runtime.Memory.ReservationUsed = 0
+		child.Runtime.Memory.ReservationUsedForVm = 0
+		child.Runtime.Memory.UnreservedForPool = resBytes
+		child.Runtime.Memory.UnreservedForVm = resBytes
+		child.Runtime.Memory.MaxUsage = resBytes
+		if spec.MemoryAllocation.Limit != nil && *spec.MemoryAllocation.Limit != -1 {
+			child.Runtime.Memory.MaxUsage = *spec.MemoryAllocation.Limit * 1024 * 1024
+		}
+	}
+
+	child.Summary.GetResourcePoolSummary().Runtime = child.Runtime
 
 	return child, nil
 }

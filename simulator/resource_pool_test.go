@@ -61,6 +61,11 @@ func TestResourcePool(t *testing.T) {
 
 	// create a child pool
 	childName := uuid.New().String()
+	spec = types.DefaultResourceConfigSpec()
+	*spec.CpuAllocation.Reservation = 100
+	*spec.CpuAllocation.Limit = 200
+	*spec.MemoryAllocation.Reservation = 512
+	*spec.MemoryAllocation.Limit = 1024
 
 	child, err := parent.Create(ctx, childName, spec)
 	if err != nil {
@@ -69,6 +74,54 @@ func TestResourcePool(t *testing.T) {
 
 	if child.Reference() == esx.ResourcePool.Self {
 		t.Error("expected new pool Self reference")
+	}
+
+	var childMo mo.ResourcePool
+	err = child.Properties(ctx, child.Reference(), []string{"config", "runtime", "summary"}, &childMo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check Runtime CPU
+	if childMo.Runtime.Cpu.ReservationUsed != 0 {
+		t.Errorf("expected Cpu.ReservationUsed 0, got %d", childMo.Runtime.Cpu.ReservationUsed)
+	}
+	if childMo.Runtime.Cpu.UnreservedForPool != 100 {
+		t.Errorf("expected Cpu.UnreservedForPool 100, got %d", childMo.Runtime.Cpu.UnreservedForPool)
+	}
+	if childMo.Runtime.Cpu.UnreservedForVm != 100 {
+		t.Errorf("expected Cpu.UnreservedForVm 100, got %d", childMo.Runtime.Cpu.UnreservedForVm)
+	}
+	if childMo.Runtime.Cpu.MaxUsage != 200 {
+		t.Errorf("expected Cpu.MaxUsage 200, got %d", childMo.Runtime.Cpu.MaxUsage)
+	}
+
+	// Check Runtime Memory
+	expectedMemBytes := int64(512 * 1024 * 1024)
+	expectedMaxMemBytes := int64(1024 * 1024 * 1024)
+	if childMo.Runtime.Memory.ReservationUsed != 0 {
+		t.Errorf("expected Memory.ReservationUsed 0, got %d", childMo.Runtime.Memory.ReservationUsed)
+	}
+	if childMo.Runtime.Memory.UnreservedForPool != expectedMemBytes {
+		t.Errorf("expected Memory.UnreservedForPool %d, got %d", expectedMemBytes, childMo.Runtime.Memory.UnreservedForPool)
+	}
+	if childMo.Runtime.Memory.UnreservedForVm != expectedMemBytes {
+		t.Errorf("expected Memory.UnreservedForVm %d, got %d", expectedMemBytes, childMo.Runtime.Memory.UnreservedForVm)
+	}
+	if childMo.Runtime.Memory.MaxUsage != expectedMaxMemBytes {
+		t.Errorf("expected Memory.MaxUsage %d, got %d", expectedMaxMemBytes, childMo.Runtime.Memory.MaxUsage)
+	}
+
+	// Check Summary Runtime matches
+	summary := childMo.Summary.GetResourcePoolSummary()
+	if summary == nil {
+		t.Fatal("expected non-nil summary")
+	}
+	if summary.Runtime.Cpu.UnreservedForPool != 100 {
+		t.Errorf("expected summary Cpu.UnreservedForPool 100, got %d", summary.Runtime.Cpu.UnreservedForPool)
+	}
+	if summary.Runtime.Memory.UnreservedForPool != expectedMemBytes {
+		t.Errorf("expected summary Memory.UnreservedForPool %d, got %d", expectedMemBytes, summary.Runtime.Memory.UnreservedForPool)
 	}
 
 	*spec.CpuAllocation.Reservation = -1
