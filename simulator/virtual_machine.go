@@ -15,12 +15,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
 
 	"github.com/vmware/govmomi/internal"
 	"github.com/vmware/govmomi/object"
@@ -2789,11 +2791,11 @@ func (vm *VirtualMachine) CloneVMTask(ctx *Context, req *types.CloneVM_Task) soa
 		})
 
 		if !req.Spec.Template && req.Spec.PowerOn {
-			res := clone.PowerOnVMTask(ctx, &types.PowerOnVM_Task{This: clone.Self})
-			ctask := ctx.Map.Get(res.(*methods.PowerOnVM_TaskBody).Res.Returnval).(*Task)
-			ctask.Wait()
-			if ctask.Info.Error != nil {
-				return nil, ctask.Info.Error.Fault
+			pres := clone.PowerOnVMTask(ctx, &types.PowerOnVM_Task{This: clone.Self})
+			ptask := ctx.Map.Get(pres.(*methods.PowerOnVM_TaskBody).Res.Returnval).(*Task)
+			ptask.Wait()
+			if ptask.Info.Error != nil {
+				return nil, ptask.Info.Error.Fault
 			}
 		}
 
@@ -2901,7 +2903,7 @@ func (vm *VirtualMachine) customize(ctx *Context) types.BaseMethodFault {
 		{Name: "config.tools.pendingCustomization", Val: ""},
 	}
 
-	if len(vm.Guest.Net) != len(vm.imc.NicSettingMap) {
+	if !customizationUsesCloudInitNetworkConfig(vm.imc) && len(vm.Guest.Net) != len(vm.imc.NicSettingMap) {
 		fault := &types.NicSettingMismatch{
 			NumberOfNicsInSpec: int32(len(vm.imc.NicSettingMap)),
 			NumberOfNicsInVM:   int32(len(vm.Guest.Net)),
@@ -2925,12 +2927,15 @@ func (vm *VirtualMachine) customize(ctx *Context) types.BaseMethodFault {
 
 	hostname := ""
 	address := ""
+	guestNetChanged := false
 
 	switch c := vm.imc.Identity.(type) {
 	case *types.CustomizationLinuxPrep:
 		hostname = customizeName(vm, c.HostName)
 	case *types.CustomizationSysprep:
 		hostname = customizeName(vm, c.UserData.ComputerName)
+	case *types.CustomizationCloudinitPrep:
+		hostname, address, guestNetChanged = vm.applyCloudInitCustomization(c)
 	}
 
 	cards := object.VirtualDeviceList(vm.Config.Hardware.Device).SelectByType((*types.VirtualEthernetCard)(nil))
@@ -2978,6 +2983,9 @@ func (vm *VirtualMachine) customize(ctx *Context) types.BaseMethodFault {
 	}
 
 	if len(vm.imc.NicSettingMap) != 0 {
+		guestNetChanged = true
+	}
+	if guestNetChanged {
 		changes = append(changes, types.PropertyChange{Name: "guest.net", Val: vm.Guest.Net})
 	}
 	if hostname != "" {
@@ -2997,6 +3005,108 @@ func (vm *VirtualMachine) customize(ctx *Context) types.BaseMethodFault {
 	ctx.Update(vm, changes)
 	ctx.postEvent(&types.CustomizationSucceeded{CustomizationEvent: event})
 	return nil
+}
+
+func customizationUsesCloudInitNetworkConfig(spec *types.CustomizationSpec) bool {
+	if spec == nil || len(spec.NicSettingMap) != 0 {
+		return false
+	}
+	_, ok := spec.Identity.(*types.CustomizationCloudinitPrep)
+	return ok
+}
+
+type cloudInitMetadata struct {
+	Hostname      string `yaml:"hostname"`
+	LocalHostname string `yaml:"local-hostname"`
+	Network       struct {
+		Ethernets map[string]cloudInitEthernet `yaml:"ethernets"`
+	} `yaml:"network"`
+}
+
+type cloudInitEthernet struct {
+	Addresses   []string `yaml:"addresses"`
+	Nameservers struct {
+		Addresses []string `yaml:"addresses"`
+		Search    []string `yaml:"search"`
+	} `yaml:"nameservers"`
+}
+
+func (vm *VirtualMachine) applyCloudInitCustomization(prep *types.CustomizationCloudinitPrep) (string, string, bool) {
+	if prep == nil || strings.TrimSpace(prep.Metadata) == "" {
+		return "", "", false
+	}
+
+	var metadata cloudInitMetadata
+	if err := yaml.Unmarshal([]byte(prep.Metadata), &metadata); err != nil {
+		vm.logPrintf("cloud-init metadata parse failed: %s", err)
+		return "", "", false
+	}
+
+	hostname := metadata.LocalHostname
+	if hostname == "" {
+		hostname = metadata.Hostname
+	}
+
+	ethernets := metadata.Network.Ethernets
+	if len(ethernets) == 0 {
+		return hostname, "", false
+	}
+
+	names := make([]string, 0, len(ethernets))
+	for name := range ethernets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	address := ""
+	changed := false
+	for i, name := range names {
+		if i >= len(vm.Guest.Net) {
+			break
+		}
+
+		config := ethernets[name]
+		nic := &vm.Guest.Net[i]
+
+		if len(config.Addresses) != 0 {
+			nic.IpAddress = cloudInitIPAddresses(config.Addresses)
+			nic.IpConfig = &types.NetIpConfigInfo{
+				IpAddress: make([]types.NetIpConfigInfoIpAddress, len(nic.IpAddress)),
+			}
+			for j, ip := range nic.IpAddress {
+				nic.IpConfig.IpAddress[j].IpAddress = ip
+			}
+			if address == "" {
+				address = nic.IpAddress[0]
+			}
+			changed = true
+		}
+
+		if len(config.Nameservers.Addresses) != 0 || len(config.Nameservers.Search) != 0 {
+			if nic.DnsConfig == nil {
+				nic.DnsConfig = new(types.NetDnsConfigInfo)
+			}
+			nic.DnsConfig.IpAddress = config.Nameservers.Addresses
+			nic.DnsConfig.SearchDomain = config.Nameservers.Search
+			changed = true
+		}
+	}
+
+	return hostname, address, changed
+}
+
+func cloudInitIPAddresses(addresses []string) []string {
+	ips := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		ip, _, err := net.ParseCIDR(address)
+		if err == nil {
+			ips = append(ips, ip.String())
+			continue
+		}
+		value, _, _ := strings.Cut(address, "/")
+		ips = append(ips, value)
+	}
+	return ips
 }
 
 func (vm *VirtualMachine) customizationInfo(status types.GuestInfoCustomizationStatus, err string) *types.GuestInfoCustomizationInfo {
@@ -3033,7 +3143,7 @@ func (vm *VirtualMachine) setPendingCustomization(ctx *Context, spec *types.Cust
 	if vm.Config.Tools.PendingCustomization != "" {
 		return new(types.CustomizationPending)
 	}
-	if len(vm.Guest.Net) != len(spec.NicSettingMap) {
+	if !customizationUsesCloudInitNetworkConfig(spec) && len(vm.Guest.Net) != len(spec.NicSettingMap) {
 		return &types.NicSettingMismatch{
 			NumberOfNicsInSpec: int32(len(spec.NicSettingMap)),
 			NumberOfNicsInVM:   int32(len(vm.Guest.Net)),
