@@ -563,8 +563,7 @@ func assertCloneCustomizationApplied(ctx context.Context, t *testing.T, vm *obje
 	var moVM mo.VirtualMachine
 	if err := vm.Properties(ctx, vm.Reference(), []string{
 		"runtime.powerState",
-		"guest.hostName",
-		"guest.ipAddress",
+		"guest",
 		"config.tools",
 	}, &moVM); err != nil {
 		t.Fatal(err)
@@ -582,11 +581,37 @@ func assertCloneCustomizationApplied(ctx context.Context, t *testing.T, vm *obje
 	if moVM.Guest.IpAddress != ip {
 		t.Fatalf("expected guest IP %q; got %q", ip, moVM.Guest.IpAddress)
 	}
+	assertGuestCustomizationInfo(ctx, t, vm, types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_SUCCEEDED, true, true)
 	if moVM.Config == nil || moVM.Config.Tools == nil {
 		t.Fatal("nil tools config")
 	}
 	if moVM.Config.Tools.PendingCustomization != "" {
 		t.Fatalf("expected pending customization to be cleared; got %q", moVM.Config.Tools.PendingCustomization)
+	}
+}
+
+func assertGuestCustomizationInfo(ctx context.Context, t *testing.T, vm *object.VirtualMachine, status types.GuestInfoCustomizationStatus, wantStart, wantEnd bool) {
+	t.Helper()
+
+	var moVM mo.VirtualMachine
+	if err := vm.Properties(ctx, vm.Reference(), []string{"guest"}, &moVM); err != nil {
+		t.Fatal(err)
+	}
+	if moVM.Guest == nil {
+		t.Fatal("nil guest info")
+	}
+	info := moVM.Guest.CustomizationInfo
+	if info == nil {
+		t.Fatal("nil guest customization info")
+	}
+	if got := info.CustomizationStatus; got != string(status) {
+		t.Fatalf("expected customization status %q; got %q", status, got)
+	}
+	if (info.StartTime != nil) != wantStart {
+		t.Fatalf("expected startTime presence %t; got %t", wantStart, info.StartTime != nil)
+	}
+	if (info.EndTime != nil) != wantEnd {
+		t.Fatalf("expected endTime presence %t; got %t", wantEnd, info.EndTime != nil)
 	}
 }
 
@@ -627,6 +652,50 @@ func TestCloneVmPowerOnAndCustomization(t *testing.T) {
 
 		clone := object.NewVirtualMachine(c, info.Result.(types.ManagedObjectReference))
 		assertCloneCustomizationApplied(ctx, t, clone, hostname, ip)
+	}, m)
+}
+
+func TestCustomizeVmCustomizationInfo(t *testing.T) {
+	m := VPX()
+	defer m.Remove()
+
+	Test(func(ctx context.Context, c *vim25.Client) {
+		vmm := m.Map().Any("VirtualMachine").(*VirtualMachine)
+		vm := object.NewVirtualMachine(c, vmm.Reference())
+
+		var moVM mo.VirtualMachine
+		if err := vm.Properties(ctx, vm.Reference(), []string{"runtime.powerState"}, &moVM); err != nil {
+			t.Fatal(err)
+		}
+		if moVM.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn {
+			task, err := vm.PowerOff(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = task.Wait(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		hostname := "customized-vm-host"
+		ip := "192.168.1.110"
+		task, err := vm.Customize(ctx, *testCloneCustomizationSpec(hostname, ip))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = task.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+		assertGuestCustomizationInfo(ctx, t, vm, types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_PENDING, false, false)
+
+		task, err = vm.PowerOn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = task.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+		assertCloneCustomizationApplied(ctx, t, vm, hostname, ip)
 	}, m)
 }
 
@@ -682,6 +751,7 @@ func TestCloneVmCustomizationPendingUntilPowerOn(t *testing.T) {
 		if moVM.Config.Tools.PendingCustomization == "" {
 			t.Fatal("expected customization to be pending")
 		}
+		assertGuestCustomizationInfo(ctx, t, clone, types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_PENDING, false, false)
 
 		task, err = clone.PowerOn(ctx)
 		if err != nil {

@@ -2774,7 +2774,7 @@ func (vm *VirtualMachine) CloneVMTask(ctx *Context, req *types.CloneVM_Task) soa
 		if req.Spec.Template {
 			_ = clone.MarkAsTemplate(&types.MarkAsTemplate{This: clone.Self})
 		} else {
-			if err := clone.setPendingCustomization(req.Spec.Customization); err != nil {
+			if err := clone.setPendingCustomization(ctx, req.Spec.Customization); err != nil {
 				return nil, err
 			}
 		}
@@ -2886,6 +2886,12 @@ func (vm *VirtualMachine) customize(ctx *Context) {
 
 	event := types.CustomizationEvent{VmEvent: vm.event(ctx)}
 	ctx.postEvent(&types.CustomizationStartedEvent{CustomizationEvent: event})
+	ctx.Update(vm, []types.PropertyChange{
+		{
+			Name: "guest.customizationInfo",
+			Val:  vm.customizationInfo(types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_RUNNING, ""),
+		},
+	})
 
 	changes := []types.PropertyChange{
 		{Name: "config.tools.pendingCustomization", Val: ""},
@@ -2900,6 +2906,10 @@ func (vm *VirtualMachine) customize(ctx *Context) {
 		})
 
 		vm.imc = nil
+		changes = append(changes, types.PropertyChange{
+			Name: "guest.customizationInfo",
+			Val:  vm.customizationInfo(types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_FAILED, "NicSettingMismatch"),
+		})
 		ctx.Update(vm, changes)
 		return
 	}
@@ -2971,11 +2981,37 @@ func (vm *VirtualMachine) customize(ctx *Context) {
 	}
 
 	vm.imc = nil
+	changes = append(changes, types.PropertyChange{
+		Name: "guest.customizationInfo",
+		Val:  vm.customizationInfo(types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_SUCCEEDED, ""),
+	})
 	ctx.Update(vm, changes)
 	ctx.postEvent(&types.CustomizationSucceeded{CustomizationEvent: event})
 }
 
-func (vm *VirtualMachine) setPendingCustomization(spec *types.CustomizationSpec) types.BaseMethodFault {
+func (vm *VirtualMachine) customizationInfo(status types.GuestInfoCustomizationStatus, err string) *types.GuestInfoCustomizationInfo {
+	info := &types.GuestInfoCustomizationInfo{
+		CustomizationStatus: string(status),
+		ErrorMsg:            err,
+	}
+
+	now := time.Now()
+	switch status {
+	case types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_RUNNING:
+		info.StartTime = &now
+	case types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_SUCCEEDED, types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_FAILED:
+		if vm.Guest != nil && vm.Guest.CustomizationInfo != nil && vm.Guest.CustomizationInfo.StartTime != nil {
+			info.StartTime = vm.Guest.CustomizationInfo.StartTime
+		} else {
+			info.StartTime = &now
+		}
+		info.EndTime = &now
+	}
+
+	return info
+}
+
+func (vm *VirtualMachine) setPendingCustomization(ctx *Context, spec *types.CustomizationSpec) types.BaseMethodFault {
 	if spec == nil {
 		return nil
 	}
@@ -2995,7 +3031,13 @@ func (vm *VirtualMachine) setPendingCustomization(spec *types.CustomizationSpec)
 	}
 
 	vm.imc = spec
-	vm.Config.Tools.PendingCustomization = uuid.New().String()
+	ctx.Update(vm, []types.PropertyChange{
+		{Name: "config.tools.pendingCustomization", Val: uuid.New().String()},
+		{
+			Name: "guest.customizationInfo",
+			Val:  vm.customizationInfo(types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_PENDING, ""),
+		},
+	})
 
 	return nil
 }
@@ -3013,7 +3055,7 @@ func (vm *VirtualMachine) CustomizeVMTask(ctx *Context, req *types.CustomizeVM_T
 			}
 		}
 
-		return nil, vm.setPendingCustomization(&req.Spec)
+		return nil, vm.setPendingCustomization(ctx, &req.Spec)
 	})
 
 	return &methods.CustomizeVM_TaskBody{
