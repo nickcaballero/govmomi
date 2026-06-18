@@ -699,6 +699,97 @@ func TestCustomizeVmCustomizationInfo(t *testing.T) {
 	}, m)
 }
 
+func TestPowerOnReturnsCustomizationFault(t *testing.T) {
+	m := VPX()
+	defer m.Remove()
+
+	Test(func(ctx context.Context, c *vim25.Client) {
+		vmm := m.Map().Any("VirtualMachine").(*VirtualMachine)
+		vm := object.NewVirtualMachine(c, vmm.Reference())
+
+		var moVM mo.VirtualMachine
+		if err := vm.Properties(ctx, vm.Reference(), []string{"runtime.powerState"}, &moVM); err != nil {
+			t.Fatal(err)
+		}
+		if moVM.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn {
+			task, err := vm.PowerOff(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = task.Wait(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		customizeTask, err := vm.Customize(ctx, *testCloneCustomizationSpec("mismatch-host", "192.168.1.130"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = customizeTask.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		devices, err := vm.Device(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nics := devices.SelectByType((*types.VirtualEthernetCard)(nil))
+		if len(nics) == 0 {
+			t.Fatal("expected VM to have at least one NIC")
+		}
+		if err = vm.RemoveDevice(ctx, false, nics...); err != nil {
+			t.Fatal(err)
+		}
+
+		powerTask, err := vm.PowerOn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = powerTask.Wait(ctx)
+		if err == nil {
+			t.Fatal("expected power-on task to return customization fault")
+		}
+		taskErr, ok := err.(task.Error)
+		if !ok {
+			t.Fatalf("expected task.Error; got %T: %v", err, err)
+		}
+		fault := taskErr.Fault()
+		if _, ok = fault.(types.BaseCustomizationFault); !ok {
+			t.Fatalf("expected customization fault; got %T", fault)
+		}
+		mismatch, ok := fault.(*types.NicSettingMismatch)
+		if !ok {
+			t.Fatalf("expected NicSettingMismatch fault; got %T", fault)
+		}
+		if mismatch.NumberOfNicsInSpec != 1 || mismatch.NumberOfNicsInVM != 0 {
+			t.Fatalf("expected NIC counts spec=1 vm=0; got spec=%d vm=%d", mismatch.NumberOfNicsInSpec, mismatch.NumberOfNicsInVM)
+		}
+
+		if err := vm.Properties(ctx, vm.Reference(), []string{
+			"runtime.powerState",
+			"guest",
+			"config.tools",
+		}, &moVM); err != nil {
+			t.Fatal(err)
+		}
+		if moVM.Runtime.PowerState != types.VirtualMachinePowerStatePoweredOn {
+			t.Fatalf("expected VM to be powered on after customization fault; got %s", moVM.Runtime.PowerState)
+		}
+		if moVM.Config.Tools.PendingCustomization != "" {
+			t.Fatalf("expected pending customization to be cleared; got %q", moVM.Config.Tools.PendingCustomization)
+		}
+		if moVM.Guest.CustomizationInfo == nil {
+			t.Fatal("nil guest customization info")
+		}
+		if moVM.Guest.CustomizationInfo.CustomizationStatus != string(types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_FAILED) {
+			t.Fatalf("expected failed customization status; got %q", moVM.Guest.CustomizationInfo.CustomizationStatus)
+		}
+		if moVM.Guest.CustomizationInfo.ErrorMsg != "NicSettingMismatch" {
+			t.Fatalf("expected NicSettingMismatch customization error; got %q", moVM.Guest.CustomizationInfo.ErrorMsg)
+		}
+	}, m)
+}
+
 func TestCloneVmCustomizationPendingUntilPowerOn(t *testing.T) {
 	m := VPX()
 	defer m.Remove()

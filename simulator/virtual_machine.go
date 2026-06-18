@@ -2225,6 +2225,7 @@ func (c *powerVMTask) Run(task *Task) (types.AnyType, types.BaseMethodFault) {
 	}
 
 	event := c.event(c.ctx)
+	var customizationFault types.BaseMethodFault
 	switch c.state {
 	case types.VirtualMachinePowerStatePoweredOn:
 		if c.VirtualMachine.hostInMM(c.ctx) {
@@ -2245,7 +2246,7 @@ func (c *powerVMTask) Run(task *Task) (types.AnyType, types.BaseMethodFault) {
 			&types.VmStartingEvent{VmEvent: event},
 			&types.VmPoweredOnEvent{VmEvent: event},
 		)
-		c.customize(c.ctx)
+		customizationFault = c.customize(c.ctx)
 	case types.VirtualMachinePowerStatePoweredOff:
 		c.svm.stop(c.ctx)
 		c.ctx.postEvent(
@@ -2290,7 +2291,7 @@ func (c *powerVMTask) Run(task *Task) (types.AnyType, types.BaseMethodFault) {
 		{Name: "config.hardware.device", Val: devices},
 	})
 
-	return nil, nil
+	return nil, customizationFault
 }
 
 func (vm *VirtualMachine) PowerOnVMTask(ctx *Context, c *types.PowerOnVM_Task) soap.HasFault {
@@ -2879,9 +2880,9 @@ func (vm *VirtualMachine) RelocateVMTask(ctx *Context, req *types.RelocateVM_Tas
 	}
 }
 
-func (vm *VirtualMachine) customize(ctx *Context) {
+func (vm *VirtualMachine) customize(ctx *Context) types.BaseMethodFault {
 	if vm.imc == nil {
-		return
+		return nil
 	}
 
 	event := types.CustomizationEvent{VmEvent: vm.event(ctx)}
@@ -2898,6 +2899,11 @@ func (vm *VirtualMachine) customize(ctx *Context) {
 	}
 
 	if len(vm.Guest.Net) != len(vm.imc.NicSettingMap) {
+		fault := &types.NicSettingMismatch{
+			NumberOfNicsInSpec: int32(len(vm.imc.NicSettingMap)),
+			NumberOfNicsInVM:   int32(len(vm.Guest.Net)),
+		}
+
 		ctx.postEvent(&types.CustomizationNetworkSetupFailed{
 			CustomizationFailed: types.CustomizationFailed{
 				CustomizationEvent: event,
@@ -2911,7 +2917,7 @@ func (vm *VirtualMachine) customize(ctx *Context) {
 			Val:  vm.customizationInfo(types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_FAILED, "NicSettingMismatch"),
 		})
 		ctx.Update(vm, changes)
-		return
+		return fault
 	}
 
 	hostname := ""
@@ -2987,6 +2993,7 @@ func (vm *VirtualMachine) customize(ctx *Context) {
 	})
 	ctx.Update(vm, changes)
 	ctx.postEvent(&types.CustomizationSucceeded{CustomizationEvent: event})
+	return nil
 }
 
 func (vm *VirtualMachine) customizationInfo(status types.GuestInfoCustomizationStatus, err string) *types.GuestInfoCustomizationInfo {
