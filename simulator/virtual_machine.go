@@ -2773,12 +2773,25 @@ func (vm *VirtualMachine) CloneVMTask(ctx *Context, req *types.CloneVM_Task) soa
 
 		if req.Spec.Template {
 			_ = clone.MarkAsTemplate(&types.MarkAsTemplate{This: clone.Self})
+		} else {
+			if err := clone.setPendingCustomization(req.Spec.Customization); err != nil {
+				return nil, err
+			}
 		}
 
 		ctx.postEvent(&types.VmClonedEvent{
 			VmCloneEvent: types.VmCloneEvent{VmEvent: clone.event(ctx)},
 			SourceVm:     *event.Vm,
 		})
+
+		if !req.Spec.Template && req.Spec.PowerOn {
+			res := clone.PowerOnVMTask(ctx, &types.PowerOnVM_Task{This: clone.Self})
+			ctask := ctx.Map.Get(res.(*methods.PowerOnVM_TaskBody).Res.Returnval).(*Task)
+			ctask.Wait()
+			if ctask.Info.Error != nil {
+				return nil, ctask.Info.Error.Fault
+			}
+		}
 
 		return ref, nil
 	})
@@ -2962,6 +2975,31 @@ func (vm *VirtualMachine) customize(ctx *Context) {
 	ctx.postEvent(&types.CustomizationSucceeded{CustomizationEvent: event})
 }
 
+func (vm *VirtualMachine) setPendingCustomization(spec *types.CustomizationSpec) types.BaseMethodFault {
+	if spec == nil {
+		return nil
+	}
+
+	if vm.Config.Tools == nil {
+		vm.Config.Tools = new(types.ToolsConfigInfo)
+	}
+
+	if vm.Config.Tools.PendingCustomization != "" {
+		return new(types.CustomizationPending)
+	}
+	if len(vm.Guest.Net) != len(spec.NicSettingMap) {
+		return &types.NicSettingMismatch{
+			NumberOfNicsInSpec: int32(len(spec.NicSettingMap)),
+			NumberOfNicsInVM:   int32(len(vm.Guest.Net)),
+		}
+	}
+
+	vm.imc = spec
+	vm.Config.Tools.PendingCustomization = uuid.New().String()
+
+	return nil
+}
+
 func (vm *VirtualMachine) CustomizeVMTask(ctx *Context, req *types.CustomizeVM_Task) soap.HasFault {
 	task := CreateTask(vm, "customizeVm", func(t *Task) (types.AnyType, types.BaseMethodFault) {
 		if vm.hostInMM(ctx) {
@@ -2974,20 +3012,8 @@ func (vm *VirtualMachine) CustomizeVMTask(ctx *Context, req *types.CustomizeVM_T
 				ExistingState:  vm.Runtime.PowerState,
 			}
 		}
-		if vm.Config.Tools.PendingCustomization != "" {
-			return nil, new(types.CustomizationPending)
-		}
-		if len(vm.Guest.Net) != len(req.Spec.NicSettingMap) {
-			return nil, &types.NicSettingMismatch{
-				NumberOfNicsInSpec: int32(len(req.Spec.NicSettingMap)),
-				NumberOfNicsInVM:   int32(len(vm.Guest.Net)),
-			}
-		}
 
-		vm.imc = &req.Spec
-		vm.Config.Tools.PendingCustomization = uuid.New().String()
-
-		return nil, nil
+		return nil, vm.setPendingCustomization(&req.Spec)
 	})
 
 	return &methods.CustomizeVM_TaskBody{

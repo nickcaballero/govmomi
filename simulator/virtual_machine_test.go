@@ -528,6 +528,232 @@ func TestCloneVm(t *testing.T) {
 	}
 }
 
+func testCloneCustomizationSpec(hostname, ip string) *types.CustomizationSpec {
+	return &types.CustomizationSpec{
+		NicSettingMap: []types.CustomizationAdapterMapping{
+			{
+				Adapter: types.CustomizationIPSettings{
+					Ip: &types.CustomizationFixedIp{
+						IpAddress: ip,
+					},
+					SubnetMask:    "255.255.255.0",
+					DnsServerList: []string{"192.168.1.1"},
+					DnsDomain:     "ad.domain",
+				},
+			},
+		},
+		Identity: &types.CustomizationLinuxPrep{
+			HostName: &types.CustomizationFixedName{
+				Name: hostname,
+			},
+			Domain:     "ad.domain",
+			TimeZone:   "Etc/UTC",
+			HwClockUTC: types.NewBool(true),
+		},
+		GlobalIPSettings: types.CustomizationGlobalIPSettings{
+			DnsSuffixList: []string{"ad.domain"},
+			DnsServerList: []string{"192.168.1.1"},
+		},
+	}
+}
+
+func assertCloneCustomizationApplied(ctx context.Context, t *testing.T, vm *object.VirtualMachine, hostname, ip string) {
+	t.Helper()
+
+	var moVM mo.VirtualMachine
+	if err := vm.Properties(ctx, vm.Reference(), []string{
+		"runtime.powerState",
+		"guest.hostName",
+		"guest.ipAddress",
+		"config.tools",
+	}, &moVM); err != nil {
+		t.Fatal(err)
+	}
+
+	if moVM.Runtime.PowerState != types.VirtualMachinePowerStatePoweredOn {
+		t.Fatalf("expected clone to be powered on; got %s", moVM.Runtime.PowerState)
+	}
+	if moVM.Guest == nil {
+		t.Fatal("nil guest info")
+	}
+	if moVM.Guest.HostName != hostname {
+		t.Fatalf("expected guest hostname %q; got %q", hostname, moVM.Guest.HostName)
+	}
+	if moVM.Guest.IpAddress != ip {
+		t.Fatalf("expected guest IP %q; got %q", ip, moVM.Guest.IpAddress)
+	}
+	if moVM.Config == nil || moVM.Config.Tools == nil {
+		t.Fatal("nil tools config")
+	}
+	if moVM.Config.Tools.PendingCustomization != "" {
+		t.Fatalf("expected pending customization to be cleared; got %q", moVM.Config.Tools.PendingCustomization)
+	}
+}
+
+func TestCloneVmPowerOnAndCustomization(t *testing.T) {
+	m := VPX()
+	defer m.Remove()
+
+	Test(func(ctx context.Context, c *vim25.Client) {
+		finder := find.NewFinder(c, false)
+		dc, err := finder.DefaultDatacenter(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		folders, err := dc.Folders(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		vmm := m.Map().Any("VirtualMachine").(*VirtualMachine)
+		vm := object.NewVirtualMachine(c, vmm.Reference())
+
+		hostname := "clone-host"
+		ip := "192.168.1.100"
+		config := types.VirtualMachineCloneSpec{
+			PowerOn:       true,
+			Customization: testCloneCustomizationSpec(hostname, ip),
+		}
+
+		task, err := vm.Clone(ctx, folders.VmFolder, "cloned-vm-power-on-customization", config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := task.WaitForResult(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		clone := object.NewVirtualMachine(c, info.Result.(types.ManagedObjectReference))
+		assertCloneCustomizationApplied(ctx, t, clone, hostname, ip)
+	}, m)
+}
+
+func TestCloneVmCustomizationPendingUntilPowerOn(t *testing.T) {
+	m := VPX()
+	defer m.Remove()
+
+	Test(func(ctx context.Context, c *vim25.Client) {
+		finder := find.NewFinder(c, false)
+		dc, err := finder.DefaultDatacenter(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		folders, err := dc.Folders(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		vmm := m.Map().Any("VirtualMachine").(*VirtualMachine)
+		vm := object.NewVirtualMachine(c, vmm.Reference())
+
+		hostname := "clone-host-deferred"
+		ip := "192.168.1.101"
+		config := types.VirtualMachineCloneSpec{
+			Customization: testCloneCustomizationSpec(hostname, ip),
+		}
+
+		task, err := vm.Clone(ctx, folders.VmFolder, "cloned-vm-deferred-customization", config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := task.WaitForResult(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		clone := object.NewVirtualMachine(c, info.Result.(types.ManagedObjectReference))
+
+		var moVM mo.VirtualMachine
+		if err := clone.Properties(ctx, clone.Reference(), []string{
+			"runtime.powerState",
+			"config.tools",
+		}, &moVM); err != nil {
+			t.Fatal(err)
+		}
+		if moVM.Runtime.PowerState != types.VirtualMachinePowerStatePoweredOff {
+			t.Fatalf("expected clone to remain powered off; got %s", moVM.Runtime.PowerState)
+		}
+		if moVM.Config == nil || moVM.Config.Tools == nil {
+			t.Fatal("nil tools config")
+		}
+		if moVM.Config.Tools.PendingCustomization == "" {
+			t.Fatal("expected customization to be pending")
+		}
+
+		task, err = clone.PowerOn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = task.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		assertCloneCustomizationApplied(ctx, t, clone, hostname, ip)
+	}, m)
+}
+
+func TestCloneVmTemplateIgnoresPowerOnAndCustomization(t *testing.T) {
+	m := VPX()
+	defer m.Remove()
+
+	Test(func(ctx context.Context, c *vim25.Client) {
+		finder := find.NewFinder(c, false)
+		dc, err := finder.DefaultDatacenter(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		folders, err := dc.Folders(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		vmm := m.Map().Any("VirtualMachine").(*VirtualMachine)
+		vm := object.NewVirtualMachine(c, vmm.Reference())
+
+		config := types.VirtualMachineCloneSpec{
+			Template:      true,
+			PowerOn:       true,
+			Customization: testCloneCustomizationSpec("ignored-template-host", "192.168.1.102"),
+		}
+
+		task, err := vm.Clone(ctx, folders.VmFolder, "cloned-template", config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := task.WaitForResult(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		clone := object.NewVirtualMachine(c, info.Result.(types.ManagedObjectReference))
+		var moVM mo.VirtualMachine
+		if err := clone.Properties(ctx, clone.Reference(), []string{
+			"config.template",
+			"runtime.powerState",
+			"config.tools",
+		}, &moVM); err != nil {
+			t.Fatal(err)
+		}
+
+		if moVM.Config == nil || !moVM.Config.Template {
+			t.Fatal("expected clone to be marked as a template")
+		}
+		if moVM.Runtime.PowerState != types.VirtualMachinePowerStatePoweredOff {
+			t.Fatalf("expected template clone to remain powered off; got %s", moVM.Runtime.PowerState)
+		}
+		if moVM.Config.Tools == nil {
+			t.Fatal("nil tools config")
+		}
+		if moVM.Config.Tools.PendingCustomization != "" {
+			t.Fatalf("expected template clone customization to be ignored; got pending value %q", moVM.Config.Tools.PendingCustomization)
+		}
+	}, m)
+}
+
 func TestCloneVmExtraConfig(t *testing.T) {
 	m := VPX()
 	defer m.Remove()
