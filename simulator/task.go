@@ -6,6 +6,7 @@ package simulator
 
 import (
 	"fmt"
+	"log"
 	"reflect"
 	"strings"
 	"time"
@@ -129,6 +130,9 @@ func (t *Task) Run(ctx *Context) types.ManagedObjectReference {
 				Fault:            err,
 				LocalizedMessage: fmt.Sprintf("%T", err),
 			}
+			log.Printf("task %s: failed - %s", t.Info.Name, fmt.Sprintf("%+v", err))
+		} else {
+			log.Printf("task %s: success", t.Info.Name)
 		}
 
 		ctx.Map.AtomicUpdate(t.ctx, t, []types.PropertyChange{
